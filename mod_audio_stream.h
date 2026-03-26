@@ -3,6 +3,7 @@
 
 #include <switch.h>
 #include <speex/speex_resampler.h>
+#include <stdint.h>
 
 #define MY_BUG_NAME "audio_stream"
 #define MAX_SESSION_ID (256)
@@ -31,12 +32,15 @@ struct private_data
     int channels;
     int audio_paused : 1;
     int close_requested : 1;
+    int cleanup_started : 1;
     char initialMetadata[8192];
     switch_buffer_t *read_sbuffer;
     switch_buffer_t *write_sbuffer;
     switch_mutex_t *write_mutex;
     switch_thread_t *write_thread;
     int rtp_packets;
+    uint64_t total_bytes_written;
+    uint64_t total_bytes_played;
 };
 
 typedef struct private_data private_t;

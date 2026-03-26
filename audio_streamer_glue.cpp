@@ -11,18 +11,48 @@
 #include <memory>
 #include <thread>
 #include <vector>
+#include <queue>
+#include <mutex>
 #include "base64.h"
+
+struct QueuedMark {
+    uint64_t bytes_to_play;
+    std::string name;
+};
 
 #define FRAME_SIZE_8000 320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 
 class AudioStreamer
 {
 public:
-    AudioStreamer(const char *uuid, const char *wsUri, responseHandler_t callback, int deflate, int heart_beat,
-                  bool suppressLog, const char *extra_headers, bool no_reconnect,
-                  const char *tls_cafile, const char *tls_keyfile, const char *tls_certfile,
-                  bool tls_disable_hostname_validation) : m_sessionId(uuid), m_notify(callback),
-                                                          m_suppress_log(suppressLog), m_extra_headers(extra_headers), m_playFile(0)
+    // Factory
+    static std::shared_ptr<AudioStreamer> create(
+        const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
+        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile,
+        const char* tls_certfile, bool tls_disable_hostname_validation) {
+
+        std::shared_ptr<AudioStreamer> sp(new AudioStreamer(
+            uuid, wsUri, callback, deflate, heart_beat,
+            suppressLog, extra_headers, tls_cafile, tls_keyfile,
+            tls_certfile, tls_disable_hostname_validation
+        ));
+
+        sp->bindCallbacks(std::weak_ptr<AudioStreamer>(sp));
+
+        sp->client.connect();
+
+        return sp;
+    }
+
+    ~AudioStreamer() = default;
+
+private:
+    // Ctor
+    AudioStreamer(
+        const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
+        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile,
+        const char* tls_certfile, bool tls_disable_hostname_validation)
+        : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), m_extra_headers(extra_headers), m_playFile(0)
     {
 
         WebSocketHeaders hdrs;
@@ -83,59 +113,80 @@ public:
         if (!hdrs.empty())
             client.setHeaders(hdrs);
 
-        // Setup a callback to be fired when a message or an event (open, close, error) is received
-        client.setMessageCallback([this](const std::string &message)
-                                  {
-                                      if (this->isCleanedUp())
-                                          return;
-                                      eventCallback(MESSAGE, message.c_str());
-                                  });
+    }
 
-        client.setOpenCallback([this]()
-                               {
-            cJSON *root;
-            root = cJSON_CreateObject();
+    struct ProcessResult {
+        switch_bool_t ok = SWITCH_FALSE;
+        std::string rewrittenJsonData;
+        std::vector<std::string> errors;
+    };
+
+    static inline void push_err(ProcessResult& out, const std::string& sid, const std::string& s) {
+        out.errors.push_back("(" + sid + ") " + s);
+    }
+
+    void bindCallbacks(std::weak_ptr<AudioStreamer> wp) {
+        client.setMessageCallback([wp](const std::string& message) {
+            auto self = wp.lock();
+            if (!self) return;
+            if (self->isCleanedUp()) return;
+            self->eventCallback(MESSAGE, message.c_str());
+        });
+
+        client.setOpenCallback([wp]() {
+            auto self = wp.lock();
+            if (!self) return;
+            if (self->isCleanedUp()) return;
+
+            cJSON* root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "status", "connected");
-            char *json_str = cJSON_PrintUnformatted(root);
-            eventCallback(CONNECT_SUCCESS, json_str);
-            cJSON_Delete(root);
-            switch_safe_free(json_str); });
+            char* json_str = cJSON_PrintUnformatted(root);
 
-        client.setErrorCallback([this](int code, const std::string &msg)
-                                {
-            cJSON *root, *message;
-            root = cJSON_CreateObject();
+            self->eventCallback(CONNECT_SUCCESS, json_str);
+
+            cJSON_Delete(root);
+            switch_safe_free(json_str);
+        });
+
+        client.setErrorCallback([wp](int code, const std::string& msg) {
+            auto self = wp.lock();
+            if (!self) return;
+            if (self->isCleanedUp()) return;
+
+            cJSON* root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "status", "error");
-            message = cJSON_CreateObject();
+            cJSON* message = cJSON_CreateObject();
             cJSON_AddNumberToObject(message, "code", code);
             cJSON_AddStringToObject(message, "error", msg.c_str());
             cJSON_AddItemToObject(root, "message", message);
 
-            char *json_str = cJSON_PrintUnformatted(root);
+            char* json_str = cJSON_PrintUnformatted(root);
 
-            eventCallback(CONNECT_ERROR, json_str);
+            self->eventCallback(CONNECT_ERROR, json_str);
 
             cJSON_Delete(root);
-            switch_safe_free(json_str); });
+            switch_safe_free(json_str);
+        });
 
-        client.setCloseCallback([this](int code, const std::string &reason)
-                                {
-            cJSON *root, *message;
-            root = cJSON_CreateObject();
+        client.setCloseCallback([wp](int code, const std::string& reason) {
+            auto self = wp.lock();
+            if (!self) return;
+            if (self->isCleanedUp()) return;
+
+            cJSON* root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "status", "disconnected");
-            message = cJSON_CreateObject();
+            cJSON* message = cJSON_CreateObject();
             cJSON_AddNumberToObject(message, "code", code);
             cJSON_AddStringToObject(message, "reason", reason.c_str());
             cJSON_AddItemToObject(root, "message", message);
-            char *json_str = cJSON_PrintUnformatted(root);
 
-            eventCallback(CONNECTION_DROPPED, json_str);
+            char* json_str = cJSON_PrintUnformatted(root);
+
+            self->eventCallback(CONNECTION_DROPPED, json_str);
 
             cJSON_Delete(root);
-            switch_safe_free(json_str); });
-
-        // Now that our callback is setup, we can start our background thread and receive messages
-        client.connect();
+            switch_safe_free(json_str);
+        });
     }
 
     switch_media_bug_t *get_media_bug(switch_core_session_t *session)
@@ -175,230 +226,225 @@ public:
         }
     }
 
-    void eventCallback(notifyEvent_t event, const char *message)
-    {
-        switch_core_session_t *psession = switch_core_session_locate(m_sessionId.c_str());
-        if (psession)
-        {
-            switch (event)
-            {
+    void eventCallback(notifyEvent_t event, const char* message) {
+        std::string msg = message ? message : "";
+
+        // processing without holding a session
+        ProcessResult pr;
+        if (event == MESSAGE) {
+            pr = processMessage(msg);
+            if (pr.ok == SWITCH_TRUE) {
+                msg = pr.rewrittenJsonData; // overwrite only on success
+            }
+        }
+
+        switch_core_session_t* psession = switch_core_session_locate(m_sessionId.c_str());
+        if (!psession) {
+            return;
+        }
+
+        for (const auto& e : pr.errors) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_ERROR, "%s\n", e.c_str());
+        }
+
+        switch (event) {
             case CONNECT_SUCCESS:
                 send_initial_metadata(psession);
-                m_notify(psession, EVENT_CONNECT, message);
+                m_notify(psession, EVENT_CONNECT, msg.c_str());
                 break;
+
             case CONNECTION_DROPPED:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection closed\n");
-                m_notify(psession, EVENT_DISCONNECT, message);
+                m_notify(psession, EVENT_DISCONNECT, msg.c_str());
                 break;
+
             case CONNECT_ERROR:
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection error\n");
-                m_notify(psession, EVENT_ERROR, message);
-
+                m_notify(psession, EVENT_ERROR, msg.c_str());
                 media_bug_close(psession);
-
                 break;
+
             case MESSAGE:
-                std::string msg(message);
-                if (processMessage(psession, msg) != SWITCH_TRUE)
-                {
-                    m_notify(psession, EVENT_JSON, msg.c_str());
-                }
-                if (!m_suppress_log)
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG, "response: %s\n", msg.c_str());
-                break;
-            }
-            switch_core_session_rwunlock(psession);
-        }
-    }
-
-    switch_bool_t processMessage(switch_core_session_t *session, std::string &message)
-    {
-        // Check if cleanup has started before accessing any session data
-        if (isCleanedUp())
-        {
-            return SWITCH_FALSE;
-        }
-
-        cJSON *json = cJSON_Parse(message.c_str());
-        switch_bool_t status = SWITCH_FALSE;
-        if (!json)
-        {
-            return status;
-        }
-        const char *jsType = cJSON_GetObjectCstr(json, "type");
-        if (jsType && strcmp(jsType, "streamAudio") == 0)
-        {
-            cJSON *jsonData = cJSON_GetObjectItem(json, "data");
-            if (jsonData)
-            {
-                cJSON *jsonFile = nullptr;
-                cJSON *jsonAudio = cJSON_DetachItemFromObject(jsonData, "audioData");
-                const char *jsAudioDataType = cJSON_GetObjectCstr(jsonData, "audioDataType");
-                std::string fileType;
-                int sampleRate;
-                if (0 == strcmp(jsAudioDataType, "raw"))
-                {
-                    cJSON *jsonSampleRate = cJSON_GetObjectItem(jsonData, "sampleRate");
-                    sampleRate = jsonSampleRate && jsonSampleRate->valueint ? jsonSampleRate->valueint : 0;
-                    std::string rawAudio;
-                    try
-                    {
-                        rawAudio = base64_decode(jsonAudio->valuestring);
-                        auto *bug = get_media_bug(session);
-                        if (bug)
-                        {
-                            auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-                            if (!tech_pvt || tech_pvt->close_requested)
-                            {
-                                cJSON_Delete(jsonAudio);
-                                cJSON_Delete(json);
-                                return SWITCH_FALSE;
-                            }
-
-                            const int inRate = tech_pvt->wsSampling;
-                            const int outRate = tech_pvt->sampling;
-                            const int channels = tech_pvt->channels;
-
-                            spx_uint32_t in_frames = rawAudio.size() / (sizeof(spx_int16_t) * channels);
-                            spx_uint32_t max_out = (spx_uint32_t)((double)in_frames * outRate / inRate) + 1;
-
-                            std::vector<spx_int16_t> in_buf(in_frames * channels);
-                            std::vector<spx_int16_t> out_buf(max_out * channels);
-                            memcpy(in_buf.data(), rawAudio.data(), rawAudio.size());
-
-                            spx_uint32_t in_len = in_frames;
-                            spx_uint32_t out_len = max_out;
-
-                            if (tech_pvt->sampling == tech_pvt->wsSampling)
-                            {
-                                out_buf = in_buf;
-                                out_len = in_len;
-                            }
-                            else
-                            {
-                                if (channels == 1)
-                                {
-                                    speex_resampler_process_int(tech_pvt->write_resampler, 0,
-                                                                in_buf.data(), &in_len,
-                                                                out_buf.data(), &out_len);
-                                }
-                                else
-                                {
-                                    speex_resampler_process_interleaved_int(tech_pvt->write_resampler,
-                                                                            in_buf.data(), &in_len,
-                                                                            out_buf.data(), &out_len);
-                                }
-                            }
-
-                            const size_t bytes_out = out_len * channels * sizeof(spx_int16_t);
-                            // Check again before locking to prevent race condition during cleanup
-                            if (tech_pvt->close_requested)
-                            {
-                                cJSON_Delete(jsonAudio);
-                                cJSON_Delete(json);
-                                return SWITCH_FALSE;
-                            }
-                            if (switch_mutex_lock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS)
-                            {
-                                size_t remaining = bytes_out;
-                                const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
-                                while (remaining > 0)
-                                {
-                                    switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
-                                    if (free_space == 0)
-                                    {
-                                        switch_mutex_unlock(tech_pvt->write_mutex);
-                                        switch_yield(10000);
-                                        switch_mutex_lock(tech_pvt->write_mutex);
-                                        continue;
+                if (pr.ok == SWITCH_TRUE) {
+                    m_notify(psession, EVENT_PLAY, msg.c_str());
+                } else {
+                    bool handled_mark_clear = false;
+                    cJSON *json = cJSON_Parse(msg.c_str());
+                    if (json) {
+                        const char *jsEvent = cJSON_GetObjectCstr(json, "event");
+                        if (jsEvent) {
+                            if (strcmp(jsEvent, "mark") == 0) {
+                                cJSON *markObj = cJSON_GetObjectItem(json, "mark");
+                                if (markObj) {
+                                    const char *markName = cJSON_GetObjectCstr(markObj, "name");
+                                    if (markName) {
+                                        auto *bug = get_media_bug(psession);
+                                        if (bug) {
+                                            auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
+                                            if (tech_pvt) {
+                                                if (switch_mutex_lock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
+                                                    queueMark(markName, tech_pvt->total_bytes_written, tech_pvt->total_bytes_played);
+                                                    switch_mutex_unlock(tech_pvt->write_mutex);
+                                                }
+                                                handled_mark_clear = true;
+                                            }
+                                        }
                                     }
-                                    size_t chunk = std::min<size_t>(remaining, free_space);
-                                    switch_buffer_write(tech_pvt->write_sbuffer, ptr, chunk);
-                                    ptr += chunk;
-                                    remaining -= chunk;
                                 }
-                                switch_mutex_unlock(tech_pvt->write_mutex);
                             }
-                            else
-                            {
-                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                                  "%s write mutex lock failed dropping all %zu bytes\n",
-                                                  tech_pvt->sessionId, bytes_out);
+                            else if (strcmp(jsEvent, "clear") == 0) {
+                                auto *bug = get_media_bug(psession);
+                                if (bug) {
+                                    auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
+                                    if (tech_pvt) {
+                                        if (switch_mutex_lock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
+                                            if (tech_pvt->write_sbuffer) {
+                                                switch_buffer_zero(tech_pvt->write_sbuffer);
+                                            }
+                                            tech_pvt->total_bytes_played = tech_pvt->total_bytes_written;
+                                            switch_mutex_unlock(tech_pvt->write_mutex);
+                                        }
+                                        clearMarks();
+                                        handled_mark_clear = true;
+                                    }
+                                }
                             }
                         }
-                    }
-                    catch (const std::exception &e)
-                    {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                          "(%s) processMessage - base64 decode error: %s\n",
-                                          m_sessionId.c_str(), e.what());
-                        cJSON_Delete(jsonAudio);
                         cJSON_Delete(json);
-                        return SWITCH_FALSE;
                     }
-                }
-                else if (0 == strcmp(jsAudioDataType, "wav"))
-                {
-                    fileType = ".wav";
-                }
-                else if (0 == strcmp(jsAudioDataType, "mp3"))
-                {
-                    fileType = ".mp3";
-                }
-                else if (0 == strcmp(jsAudioDataType, "ogg"))
-                {
-                    fileType = ".ogg";
-                }
-                else
-                {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%s) processMessage - unsupported audio type: %s\n",
-                                      m_sessionId.c_str(), jsAudioDataType);
+
+                    if (!handled_mark_clear) {
+                        m_notify(psession, EVENT_JSON, msg.c_str());
+                    }
                 }
 
-                if (jsonAudio && jsonAudio->valuestring != nullptr && !fileType.empty())
-                {
-                    char filePath[256];
-                    std::string rawAudio;
-                    try
-                    {
-                        rawAudio = base64_decode(jsonAudio->valuestring);
-                    }
-                    catch (const std::exception &e)
-                    {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%s) processMessage - base64 decode error: %s\n",
-                                          m_sessionId.c_str(), e.what());
-                        cJSON_Delete(jsonAudio);
-                        cJSON_Delete(json);
-                        return status;
-                    }
-                    switch_snprintf(filePath, 256, "%s%s%s_%d.tmp%s", SWITCH_GLOBAL_dirs.temp_dir,
-                                    SWITCH_PATH_SEPARATOR, m_sessionId.c_str(), m_playFile++, fileType.c_str());
-                    std::ofstream fstream(filePath, std::ofstream::binary);
-                    fstream << rawAudio;
-                    fstream.close();
-                    m_Files.insert(filePath);
-                    jsonFile = cJSON_CreateString(filePath);
-                    cJSON_AddItemToObject(jsonData, "file", jsonFile);
+                if (!m_suppress_log) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG, "response: %s\n", msg.c_str());
                 }
+                break;
+        }
 
-                if (jsonFile)
-                {
-                    char *jsonString = cJSON_PrintUnformatted(jsonData);
-                    m_notify(session, EVENT_PLAY, jsonString);
-                    message.assign(jsonString);
-                    free(jsonString);
-                    status = SWITCH_TRUE;
-                }
-                if (jsonAudio)
-                    cJSON_Delete(jsonAudio);
+        switch_core_session_rwunlock(psession);
+    }
+
+    ProcessResult processMessage(const std::string& message) {
+        ProcessResult out;
+
+        // RAII
+        using jsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
+        jsonPtr root(cJSON_Parse(message.c_str()), &cJSON_Delete);
+        if (!root) return out;
+
+        const char* jsonType = cJSON_GetObjectCstr(root.get(), "type");
+        if (!jsonType || std::strcmp(jsonType, "streamAudio") != 0) {
+            return out; // not ours
+        }
+
+        cJSON* jsonData = cJSON_GetObjectItem(root.get(), "data");
+        if (!jsonData) {
+            push_err(out, m_sessionId, "processMessage - no data in streamAudio");
+            return out;
+        }
+
+        const char* jsAudioDataType = cJSON_GetObjectCstr(jsonData, "audioDataType");
+        if (!jsAudioDataType) jsAudioDataType = "";
+
+        jsonPtr jsonAudio(cJSON_DetachItemFromObject(jsonData, "audioData"), &cJSON_Delete);
+
+        if (!jsonAudio) {
+            push_err(out, m_sessionId, "processMessage - streamAudio missing 'audioData' field");
+            return out;
+        }
+
+        if (!cJSON_IsString(jsonAudio.get()) || !jsonAudio->valuestring) {
+            push_err(out, m_sessionId, "processMessage - 'audioData' is not a string (expected base64 string)");
+            return out;
+        }
+
+        // sampleRate (only meaningful for raw)
+        int sampleRate = 0;
+        if (cJSON* jsonSampleRate = cJSON_GetObjectItem(jsonData, "sampleRate")) {
+            sampleRate = jsonSampleRate->valueint;
+        }
+
+        // map file type
+        std::string fileType;
+        if (std::strcmp(jsAudioDataType, "raw") == 0) {
+            switch (sampleRate) {
+                case 8000:  fileType = ".r8";  break;
+                case 16000: fileType = ".r16"; break;
+                case 24000: fileType = ".r24"; break;
+                case 32000: fileType = ".r32"; break;
+                case 48000: fileType = ".r48"; break;
+                case 64000: fileType = ".r64"; break;
+                default:
+                    push_err(out, m_sessionId, "processMessage - unsupported sample rate: " + std::to_string(sampleRate));
+                    return out;
             }
-            else
-            {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%s) processMessage - no data in streamAudio\n", m_sessionId.c_str());
+        } else if (std::strcmp(jsAudioDataType, "wav") == 0)  fileType = ".wav";
+        else if (std::strcmp(jsAudioDataType, "mp3") == 0)   fileType = ".mp3";
+        else if (std::strcmp(jsAudioDataType, "ogg") == 0)   fileType = ".ogg";
+        else if (std::strcmp(jsAudioDataType, "pcmu") == 0)  fileType = ".pcmu";
+        else if (std::strcmp(jsAudioDataType, "pcma") == 0)  fileType = ".pcma";
+        else {
+            push_err(out, m_sessionId, "processMessage - unsupported audio type: " + std::string(jsAudioDataType));
+            return out;
+        }
+
+        // base64 decode
+        std::string decoded;
+        try {
+            decoded = base64_decode(jsonAudio->valuestring);
+        } catch (const std::exception& e) {
+            push_err(out, m_sessionId, "processMessage - base64 decode error: " + std::string(e.what()));
+            return out;
+        }
+
+        // reserve file index
+        int idx = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_stateMutex);
+            idx = m_playFile++;
+        }
+
+        char filePath[256];
+        switch_snprintf(filePath, sizeof(filePath), "%s%s%s_%d.tmp%s",
+                        SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR,
+                        m_sessionId.c_str(), idx, fileType.c_str());
+
+        // write file
+        {
+            std::ofstream f(filePath, std::ios::binary);
+            if (!f.is_open()) {
+                push_err(out, m_sessionId, std::string("processMessage - failed to open file for write: ") + filePath);
+                return out;
+            }
+            f.write(decoded.data(), static_cast<std::streamsize>(decoded.size()));
+            if (!f.good()) {
+                push_err(out, m_sessionId, std::string("processMessage - failed writing file: ") + filePath);
+                return out;
             }
         }
-        cJSON_Delete(json);
-        return status;
+
+        // track file for cleanup
+        {
+            std::lock_guard<std::mutex> lk(m_stateMutex);
+            m_Files.insert(filePath);
+        }
+
+        cJSON_AddItemToObject(jsonData, "file", cJSON_CreateString(filePath));
+
+        // return rewritten jsonData as string
+        char* jsonString = cJSON_PrintUnformatted(jsonData);
+        if (!jsonString) {
+            push_err(out, m_sessionId, "processMessage - cJSON_PrintUnformatted failed");
+            return out;
+        }
+
+        out.rewrittenJsonData.assign(jsonString);
+        std::free(jsonString);
+        out.ok = SWITCH_TRUE;
+        return out;
     }
 
     ~AudioStreamer() = default;
@@ -430,12 +476,19 @@ public:
 
     void deleteFiles()
     {
-        if (m_playFile > 0)
+        std::vector<std::string> files;
         {
-            for (const auto &fileName : m_Files)
-            {
-                remove(fileName.c_str());
-            }
+            std::lock_guard<std::mutex> lk(m_stateMutex);
+            if (m_Files.empty())
+                return;
+
+            files.assign(m_Files.begin(), m_Files.end());
+            m_Files.clear();
+            m_playFile = 0;
+        }
+
+        for (const auto& fn : files) {
+            ::remove(fn.c_str());
         }
     }
 
@@ -454,7 +507,57 @@ public:
         return m_cleanedUp.load(std::memory_order_acquire);
     }
 
+    void queueMark(const std::string& name, uint64_t bytes_written, uint64_t bytes_played)
+    {
+        std::lock_guard<std::mutex> lock(m_marksMutex);
+        if (bytes_written == bytes_played)
+        {
+            sendMark(name);
+        }
+        else
+        {
+            m_Marks.push({bytes_written, name});
+        }
+    }
+
+    void checkMarks(uint64_t bytes_played)
+    {
+        std::lock_guard<std::mutex> lock(m_marksMutex);
+        while (!m_Marks.empty() && bytes_played >= m_Marks.front().bytes_to_play)
+        {
+            sendMark(m_Marks.front().name);
+            m_Marks.pop();
+        }
+    }
+
+    void clearMarks()
+    {
+        std::lock_guard<std::mutex> lock(m_marksMutex);
+        while (!m_Marks.empty())
+        {
+            sendMark(m_Marks.front().name);
+            m_Marks.pop();
+        }
+    }
+
 private:
+    void sendMark(const std::string& name)
+    {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "event", "mark");
+        cJSON_AddStringToObject(root, "stream_id", m_sessionId.c_str());
+        char seqStr[32];
+        snprintf(seqStr, sizeof(seqStr), "%u", ++m_markSequenceNumber);
+        cJSON_AddStringToObject(root, "sequence_number", seqStr);
+        cJSON *markObj = cJSON_CreateObject();
+        cJSON_AddStringToObject(markObj, "name", name.c_str());
+        cJSON_AddItemToObject(root, "mark", markObj);
+        char *json_str = cJSON_PrintUnformatted(root);
+        writeText(json_str);
+        switch_safe_free(json_str);
+        cJSON_Delete(root);
+    }
+
     std::string m_sessionId;
     responseHandler_t m_notify;
     WebSocketClient client;
@@ -463,6 +566,10 @@ private:
     int m_playFile;
     std::unordered_set<std::string> m_Files;
     std::atomic<bool> m_cleanedUp{false};
+    std::mutex m_stateMutex;
+    std::mutex m_marksMutex;
+    std::queue<QueuedMark> m_Marks;
+    uint32_t m_markSequenceNumber{0};
 };
 
 namespace
@@ -542,6 +649,15 @@ namespace
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
                     switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+
+                    tech_pvt->total_bytes_played += write_frame.datalen;
+                    if (tech_pvt->pAudioStreamer)
+                    {
+                        auto sp_ptr = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+                        if (sp_ptr && *sp_ptr) {
+                            (*sp_ptr)->checkMarks(tech_pvt->total_bytes_played);
+                        }
+                    }
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
             }
@@ -556,7 +672,7 @@ namespace
     switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri,
                                      uint32_t sampling, int wsSampling, int channels, char *metadata, responseHandler_t responseHandler,
                                      int deflate, int heart_beat, bool suppressLog, int rtp_packets, const char *extra_headers,
-                                     bool no_reconnect, const char *tls_cafile, const char *tls_keyfile,
+                                     const char *tls_cafile, const char *tls_keyfile,
                                      const char *tls_certfile, bool tls_disable_hostname_validation)
     {
         int err; // speex
@@ -580,11 +696,11 @@ namespace
         // size_t buflen = (FRAME_SIZE_8000 * wsSampling / 8000 * channels * 1000 / RTP_PERIOD * BUFFERED_SEC);
         const size_t buflen = (FRAME_SIZE_8000 * wsSampling / 8000 * channels * rtp_packets);
 
-        auto *as = new AudioStreamer(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
-                                     suppressLog, extra_headers, no_reconnect,
-                                     tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation);
+        auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
+                                        suppressLog, extra_headers, tls_cafile, tls_keyfile,
+                                        tls_certfile, tls_disable_hostname_validation);
 
-        tech_pvt->pAudioStreamer = static_cast<void *>(as);
+        tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
 
         switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
         switch_mutex_init(&tech_pvt->write_mutex, SWITCH_MUTEX_NESTED, pool);
@@ -658,24 +774,13 @@ namespace
         }
         if (tech_pvt->pAudioStreamer)
         {
-            auto *as = (AudioStreamer *)tech_pvt->pAudioStreamer;
-            delete as;
+            auto *sp_ptr = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+            delete sp_ptr;
             tech_pvt->pAudioStreamer = nullptr;
         }
     }
 
-    void finish(private_t *tech_pvt)
-    {
-        auto *audioStreamer = (AudioStreamer *)tech_pvt->pAudioStreamer;
-        if (audioStreamer)
-        {
-            // Mark as cleaned up and clear callbacks FIRST to prevent race conditions
-            audioStreamer->markCleanedUp();
-            // Disconnect synchronously to ensure no callbacks fire during cleanup
-            audioStreamer->disconnect();
-            tech_pvt->pAudioStreamer = nullptr;
-        }
-    }
+    // finish is removed since cleanup is done via shared_ptr destruction
 
 }
 
@@ -799,273 +904,124 @@ extern "C"
 
         if (!tech_pvt)
             return SWITCH_STATUS_FALSE;
-        auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-        if (pAudioStreamer && text)
-            pAudioStreamer->writeText(text);
 
-        return SWITCH_STATUS_SUCCESS;
-    }
+        std::shared_ptr<AudioStreamer> streamer;
+        std::vector<std::vector<uint8_t>> pending_send;
 
-    switch_status_t stream_session_pauseresume(switch_core_session_t *session, int pause)
-    {
-        switch_channel_t *channel = switch_core_session_get_channel(session);
-        auto *bug = (switch_media_bug_t *)switch_channel_get_private(channel, MY_BUG_NAME);
-        if (!bug)
-        {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "stream_session_pauseresume failed because no bug\n");
-            return SWITCH_STATUS_FALSE;
-        }
-        auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-
-        if (!tech_pvt)
-            return SWITCH_STATUS_FALSE;
-
-        switch_core_media_bug_flush(bug);
-        tech_pvt->audio_paused = pause;
-        return SWITCH_STATUS_SUCCESS;
-    }
-
-    switch_status_t stream_session_init(switch_core_session_t *session,
-                                        responseHandler_t responseHandler,
-                                        uint32_t samples_per_second,
-                                        char *wsUri,
-                                        int wsSampling,
-                                        int channels,
-                                        char *metadata,
-                                        void **ppUserData)
-    {
-        int deflate, heart_beat;
-        bool suppressLog = false;
-        const char *buffer_size;
-        const char *extra_headers;
-        int rtp_packets = 1; // 20ms burst
-        bool no_reconnect = false;
-        const char *tls_cafile = NULL;
-        ;
-        const char *tls_keyfile = NULL;
-        ;
-        const char *tls_certfile = NULL;
-        ;
-        bool tls_disable_hostname_validation = false;
-
-        switch_channel_t *channel = switch_core_session_get_channel(session);
-
-        if (switch_channel_var_true(channel, "STREAM_MESSAGE_DEFLATE"))
-        {
-            deflate = 1;
-        }
-
-        if (switch_channel_var_true(channel, "STREAM_SUPPRESS_LOG"))
-        {
-            suppressLog = true;
-        }
-
-        if (switch_channel_var_true(channel, "STREAM_NO_RECONNECT"))
-        {
-            no_reconnect = true;
-        }
-
-        tls_cafile = switch_channel_get_variable(channel, "STREAM_TLS_CA_FILE");
-        tls_keyfile = switch_channel_get_variable(channel, "STREAM_TLS_KEY_FILE");
-        tls_certfile = switch_channel_get_variable(channel, "STREAM_TLS_CERT_FILE");
-
-        if (switch_channel_var_true(channel, "STREAM_TLS_DISABLE_HOSTNAME_VALIDATION"))
-        {
-            tls_disable_hostname_validation = true;
-        }
-
-        const char *heartBeat = switch_channel_get_variable(channel, "STREAM_HEART_BEAT");
-        if (heartBeat)
-        {
-            char *endptr;
-            long value = strtol(heartBeat, &endptr, 10);
-            if (*endptr == '\0' && value <= INT_MAX && value >= INT_MIN)
-            {
-                heart_beat = (int)value;
-            }
-        }
-
-        if ((buffer_size = switch_channel_get_variable(channel, "STREAM_BUFFER_SIZE")))
-        {
-            int bSize = atoi(buffer_size);
-            if (bSize % 20 != 0)
-            {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "%s: Buffer size of %s is not a multiple of 20ms. Using default 20ms.\n",
-                                  switch_channel_get_name(channel), buffer_size);
-            }
-            else if (bSize >= 20)
-            {
-                rtp_packets = bSize / 20;
-            }
-        }
-
-        extra_headers = switch_channel_get_variable(channel, "STREAM_EXTRA_HEADERS");
-
-        // allocate per-session tech_pvt
-        auto *tech_pvt = (private_t *)switch_core_session_alloc(session, sizeof(private_t));
-
-        if (!tech_pvt)
-        {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error allocating memory!\n");
-            return SWITCH_STATUS_FALSE;
-        }
-        if (SWITCH_STATUS_SUCCESS != stream_data_init(tech_pvt, session, wsUri, samples_per_second, wsSampling, channels, metadata, responseHandler, deflate, heart_beat,
-                                                      suppressLog, rtp_packets, extra_headers, no_reconnect, tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation))
-        {
-            destroy_tech_pvt(tech_pvt);
-            return SWITCH_STATUS_FALSE;
-        }
-
-        *ppUserData = tech_pvt;
-
-        return SWITCH_STATUS_SUCCESS;
-    }
-
-    switch_status_t stream_session_write_thread_init(switch_core_session_t *session, void *pUserData)
-    {
-        private_t *tech_pvt = (private_t *)pUserData;
-        switch_threadattr_t *thd_attr = NULL;
-        switch_threadattr_create(&thd_attr, switch_core_session_get_pool(session));
-        switch_threadattr_detach_set(thd_attr, 0);
-        switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
-        switch_thread_create(&tech_pvt->write_thread, thd_attr, write_frame_thread, session, switch_core_session_get_pool(session));
-        return SWITCH_STATUS_SUCCESS;
-    }
-
-    switch_bool_t stream_frame(switch_media_bug_t *bug)
-    {
-        auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-        if (!tech_pvt || tech_pvt->audio_paused)
+        if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
             return SWITCH_TRUE;
-        /*
-        auto flush_read_sbuffer = [&]() {
-            switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
-            if (inuse > 0) {
-                std::vector<uint8_t> tmp(inuse);
-                switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
-                switch_buffer_zero(tech_pvt->read_sbuffer);
-                pAudioStreamer->writeBinary(tmp.data(), inuse);
-            }
-        };
-        */
-        if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS)
-        {
+        }
 
-            if (!tech_pvt->pAudioStreamer)
-            {
-                switch_mutex_unlock(tech_pvt->mutex);
-                return SWITCH_TRUE;
-            }
-
-            auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-
-            if (!pAudioStreamer->isConnected())
-            {
-                switch_mutex_unlock(tech_pvt->mutex);
-                return SWITCH_TRUE;
-            }
-
-            if (nullptr == tech_pvt->read_resampler)
-            {
-
-                uint8_t data_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
-                switch_frame_t frame = {0};
-                frame.data = data_buf;
-                frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-                size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
-
-                while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
-                {
-                    if (frame.datalen)
-                    {
-                        if (1 == tech_pvt->rtp_packets)
-                        {
-                            pAudioStreamer->writeBinary((uint8_t *)frame.data, frame.datalen);
-                            continue;
-                        }
-                        if (available >= frame.datalen)
-                        {
-                            switch_buffer_write(tech_pvt->read_sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
-                        }
-                        if (0 == switch_buffer_freespace(tech_pvt->read_sbuffer))
-                        {
-                            switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
-                            if (inuse > 0)
-                            {
-                                std::vector<uint8_t> tmp(inuse);
-                                switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
-                                switch_buffer_zero(tech_pvt->read_sbuffer);
-                                pAudioStreamer->writeBinary(tmp.data(), inuse);
-                            }
-                        }
-                    }
-                }
-            }
-            else
-            {
-
-                uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
-                switch_frame_t frame = {};
-                frame.data = data;
-                frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-                const size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
-
-                while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
-                {
-                    if (frame.datalen)
-                    {
-                        spx_uint32_t in_len = frame.samples;
-                        spx_uint32_t out_len = (available / (tech_pvt->channels * sizeof(spx_int16_t)));
-                        spx_int16_t out[available / sizeof(spx_int16_t)];
-
-                        if (tech_pvt->channels == 1)
-                        {
-                            speex_resampler_process_int(tech_pvt->read_resampler,
-                                                        0,
-                                                        (const spx_int16_t *)frame.data,
-                                                        &in_len,
-                                                        &out[0],
-                                                        &out_len);
-                        }
-                        else
-                        {
-                            speex_resampler_process_interleaved_int(tech_pvt->read_resampler,
-                                                                    (const spx_int16_t *)frame.data,
-                                                                    &in_len,
-                                                                    &out[0],
-                                                                    &out_len);
-                        }
-
-                        if (out_len > 0)
-                        {
-                            const size_t bytes_written = out_len * tech_pvt->channels * sizeof(spx_int16_t);
-                            if (tech_pvt->rtp_packets == 1)
-                            { // 20ms packet
-                                pAudioStreamer->writeBinary((uint8_t *)out, bytes_written);
-                                continue;
-                            }
-                            if (bytes_written <= available)
-                            {
-                                switch_buffer_write(tech_pvt->read_sbuffer, (const uint8_t *)out, bytes_written);
-                            }
-                        }
-
-                        if (switch_buffer_freespace(tech_pvt->read_sbuffer) == 0)
-                        {
-                            switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
-                            if (inuse > 0)
-                            {
-                                std::vector<uint8_t> tmp(inuse);
-                                switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
-                                switch_buffer_zero(tech_pvt->read_sbuffer);
-                                pAudioStreamer->writeBinary(tmp.data(), inuse);
-                            }
-                        }
-                    }
-                }
-            }
-
+        if (!tech_pvt->pAudioStreamer) {
             switch_mutex_unlock(tech_pvt->mutex);
+            return SWITCH_TRUE;
+        }
+
+        auto sp_ptr = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+        if (!sp_ptr || !(*sp_ptr)) {
+            switch_mutex_unlock(tech_pvt->mutex);
+            return SWITCH_TRUE;
+        }
+
+        streamer = *sp_ptr;
+
+        if (nullptr == tech_pvt->read_resampler) {
+
+            uint8_t data_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
+            switch_frame_t frame = {0};
+            frame.data = data_buf;
+            frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
+            size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
+
+            while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
+                if (!frame.datalen) {
+                    continue;
+                }
+
+                if (tech_pvt->rtp_packets == 1) {
+                    pending_send.emplace_back((uint8_t*)frame.data, (uint8_t*)frame.data + frame.datalen);
+                    continue;
+                }
+
+                if (available >= frame.datalen) {
+                    switch_buffer_write(tech_pvt->read_sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
+                }
+
+                if (0 == switch_buffer_freespace(tech_pvt->read_sbuffer)) {
+                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
+                    if (inuse > 0) {
+                        std::vector<uint8_t> tmp(inuse);
+                        switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
+                        switch_buffer_zero(tech_pvt->read_sbuffer);
+                        pending_send.emplace_back(std::move(tmp));
+                    }
+                }
+            }
+
+        } else {
+
+            uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+            switch_frame_t frame = {};
+            frame.data = data;
+            frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
+            const size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
+
+            while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
+                if(!frame.datalen) {
+                    continue;
+                }
+
+                spx_uint32_t in_len = frame.samples;
+                spx_uint32_t out_len = (available / (tech_pvt->channels * sizeof(spx_int16_t)));
+                spx_int16_t out[available / sizeof(spx_int16_t)];
+
+                if(tech_pvt->channels == 1) {
+                    speex_resampler_process_int(tech_pvt->read_resampler,
+                                    0,
+                                    (const spx_int16_t *)frame.data,
+                                    &in_len,
+                                    &out[0],
+                                    &out_len);
+                } else {
+                    speex_resampler_process_interleaved_int(tech_pvt->read_resampler,
+                                    (const spx_int16_t *)frame.data,
+                                    &in_len,
+                                    &out[0],
+                                    &out_len);
+                }
+
+                if(out_len > 0) {
+                    const size_t bytes_written = out_len * tech_pvt->channels * sizeof(spx_int16_t);
+                    if (tech_pvt->rtp_packets == 1) { //20ms packet
+                        const uint8_t* p = (const uint8_t*)out;
+                        pending_send.emplace_back(p, p + bytes_written);
+                        continue;
+                    }
+                    if (bytes_written <= available) {
+                        switch_buffer_write(tech_pvt->read_sbuffer, (const uint8_t *)out, bytes_written);
+                    }
+                }
+
+                if(switch_buffer_freespace(tech_pvt->read_sbuffer) == 0) {
+                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
+                    if (inuse > 0) {
+                        std::vector<uint8_t> tmp(inuse);
+                        switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
+                        switch_buffer_zero(tech_pvt->read_sbuffer);
+                        pending_send.emplace_back(std::move(tmp));
+                    }
+                }
+            }
+        }
+
+        switch_mutex_unlock(tech_pvt->mutex);
+
+        if (!streamer || !streamer->isConnected()) return SWITCH_TRUE;
+
+        for (auto &chunk : pending_send) {
+            if (!chunk.empty()) {
+                streamer->writeBinary(chunk.data(), chunk.size());
+            }
         }
 
         return SWITCH_TRUE;
@@ -1082,6 +1038,13 @@ extern "C"
             strcpy(sessionId, tech_pvt->sessionId);
 
             switch_mutex_lock(tech_pvt->mutex);
+
+            if (tech_pvt->cleanup_started) {
+                switch_mutex_unlock(tech_pvt->mutex);
+                return SWITCH_STATUS_SUCCESS;
+            }
+            tech_pvt->cleanup_started = 1;
+
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
 
             tech_pvt->close_requested = 1;
@@ -1095,16 +1058,30 @@ extern "C"
                 switch_core_media_bug_remove(session, &bug);
             }
 
-            auto *audioStreamer = (AudioStreamer *)tech_pvt->pAudioStreamer;
-            if (audioStreamer)
-            {
-                audioStreamer->deleteFiles();
-                if (text)
-                    audioStreamer->writeText(text);
-                finish(tech_pvt);
+            std::shared_ptr<AudioStreamer>* sp_wrap = nullptr;
+            std::shared_ptr<AudioStreamer> streamer;
+
+            sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+            tech_pvt->pAudioStreamer = nullptr;
+
+            if (sp_wrap && *sp_wrap) {
+                streamer = *sp_wrap;
             }
 
             switch_mutex_unlock(tech_pvt->mutex);
+
+            if (sp_wrap) {
+                delete sp_wrap;
+                sp_wrap = nullptr;
+            }
+
+            if(streamer) {
+                streamer->deleteFiles();
+                if (text) streamer->writeText(text);
+
+                streamer->markCleanedUp();
+                streamer->disconnect();
+            }
 
             if (write_thread)
             {

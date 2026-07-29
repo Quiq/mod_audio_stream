@@ -39,7 +39,6 @@ struct private_data {
     int close_requested;
     int cleanup_started;
     switch_buffer_t *read_sbuffer;
-    switch_buffer_t *write_sbuffer;
     switch_mutex_t *write_mutex;
     switch_thread_t *write_thread;
     /* Set by write_frame_thread on exit, read by cleanup; always under write_mutex. */

@@ -10,10 +10,17 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
+
+// A mark waiting for playback to reach bytes_to_play
+struct QueuedMark {
+    uint64_t bytes_to_play;
+    std::string name;
+};
 
 class AudioStreamer {
 public:
@@ -97,7 +104,72 @@ public:
         return m_cleanedUp.load(std::memory_order_acquire);
     }
 
+    // Published once by write_frame_thread; see markDue()
+    void setFrameBytes(uint32_t bytes) {
+        m_frameBytes.store(bytes, std::memory_order_release);
+    }
+
+    /* Queue a mark from the server, or echo it back now if its audio has
+       already played. Counters must be a snapshot taken under write_mutex;
+       do not hold that lock across this call. */
+    void queueMark(const std::string& name, uint64_t bytes_written, uint64_t bytes_played) {
+        std::lock_guard<std::mutex> lk(m_marksMutex);
+        if (markDue(bytes_written, bytes_played)) {
+            sendMark(name);
+        } else {
+            m_Marks.push({bytes_written, name});
+        }
+    }
+
+    // Echo back marks whose audio has finished playing
+    void checkMarks(uint64_t bytes_played) {
+        std::lock_guard<std::mutex> lk(m_marksMutex);
+        while (!m_Marks.empty() && markDue(m_Marks.front().bytes_to_play, bytes_played)) {
+            sendMark(m_Marks.front().name);
+            m_Marks.pop();
+        }
+    }
+
+    // A clear returns all queued marks
+    void clearMarks() {
+        std::lock_guard<std::mutex> lk(m_marksMutex);
+        while (!m_Marks.empty()) {
+            sendMark(m_Marks.front().name);
+            m_Marks.pop();
+        }
+    }
+
 private:
+    /* write_frame_thread only drains whole frames, so a sub-frame tail can sit
+       in the buffer indefinitely once the server stops sending. Treat a
+       remainder below one frame as played, or end-of-utterance marks would
+       stall until the next utterance refilled the buffer. */
+    bool markDue(uint64_t target, uint64_t played) const {
+        if (played >= target) return true;
+        const uint64_t frame = m_frameBytes.load(std::memory_order_acquire);
+        return frame > 0 && (target - played) < frame;
+    }
+
+    // Caller must hold m_marksMutex; it also guards m_markSequenceNumber
+    void sendMark(const std::string& name) {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "event", "mark");
+        cJSON_AddStringToObject(root, "stream_id", m_sessionId.c_str());
+        char seqStr[32];
+        snprintf(seqStr, sizeof(seqStr), "%u", ++m_markSequenceNumber);
+        cJSON_AddStringToObject(root, "sequence_number", seqStr);
+        cJSON *markObj = cJSON_CreateObject();
+        cJSON_AddStringToObject(markObj, "name", name.c_str());
+        cJSON_AddItemToObject(root, "mark", markObj);
+
+        char *json_str = cJSON_PrintUnformatted(root);
+        if (json_str) {
+            writeText(json_str);
+            switch_safe_free(json_str);
+        }
+        cJSON_Delete(root);
+    }
+
     // Ctor
     AudioStreamer(
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
@@ -313,6 +385,15 @@ private:
             return;
         }
 
+        /* Count the whole utterance up front. write_sbuffer holds only one
+           frame, so the loop below is mostly blocked with the audio still in
+           out_buf; counting per chunk would track the buffer rather than the
+           audio pending, and every mark would look complete on arrival. */
+        tech_pvt->total_bytes_written += bytes_out;
+
+        // Bumped by a clear to cancel the utterance being fed below
+        const uint64_t my_generation = tech_pvt->audio_generation;
+
         size_t remaining = bytes_out;
         const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
         while (remaining > 0) {
@@ -323,6 +404,11 @@ private:
                would prevent FreeSWITCH from write-locking the session for
                destruction, causing a permanent hung session. */
             if (tech_pvt->close_requested || tech_pvt->cleanup_started) {
+                break;
+            }
+            /* Superseded by a clear. Without this the barge-in drops only the
+               frame already buffered and this loop keeps feeding the rest. */
+            if (tech_pvt->audio_generation != my_generation) {
                 break;
             }
             switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
@@ -338,7 +424,70 @@ private:
             remaining -= chunk;
         }
 
+        // Unwritten audio will never play; don't strand marks waiting on it
+        if (remaining > 0) {
+            tech_pvt->total_bytes_played += remaining;
+        }
+
         switch_mutex_unlock(tech_pvt->write_mutex);
+    }
+
+    // Handle mark/clear; returns true if consumed (no EVENT_JSON is fired)
+    bool handleMarkOrClear(switch_core_session_t *session, const std::string& msg) {
+        using jsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
+        jsonPtr root(cJSON_Parse(msg.c_str()), &cJSON_Delete);
+        if (!root) return false;
+
+        const char *jsEvent = cJSON_GetObjectCstr(root.get(), "event");
+        if (!jsEvent) return false;
+
+        const bool isMark  = std::strcmp(jsEvent, "mark") == 0;
+        const bool isClear = std::strcmp(jsEvent, "clear") == 0;
+        if (!isMark && !isClear) return false;
+
+        const char *markName = nullptr;
+        if (isMark) {
+            cJSON *markObj = cJSON_GetObjectItem(root.get(), "mark");
+            if (!markObj) return false;
+            markName = cJSON_GetObjectCstr(markObj, "name");
+            if (!markName) return false;
+        }
+
+        auto *bug = get_media_bug(session);
+        if (!bug) return false;
+        auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt || tech_pvt->close_requested || tech_pvt->cleanup_started) return false;
+
+        if (switch_mutex_lock(tech_pvt->write_mutex) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "%s handleMarkOrClear: write mutex lock failed, ignoring '%s'\n",
+                              tech_pvt->sessionId, jsEvent);
+            return false;
+        }
+
+        if (isMark) {
+            // Release before queueMark: it may send, and must not block the write thread
+            const uint64_t written = tech_pvt->total_bytes_written;
+            const uint64_t played  = tech_pvt->total_bytes_played;
+            switch_mutex_unlock(tech_pvt->write_mutex);
+            queueMark(markName, written, played);
+        } else {
+            if (tech_pvt->write_sbuffer) {
+                switch_buffer_zero(tech_pvt->write_sbuffer);
+            }
+            // Supersede any injectRawAudio still feeding the interrupted utterance
+            tech_pvt->audio_generation++;
+            tech_pvt->total_bytes_played = tech_pvt->total_bytes_written;
+            switch_mutex_unlock(tech_pvt->write_mutex);
+
+            clearMarks();
+            discardIncomingAudio();
+
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                              "clear: write buffer zeroed, marks flushed, incoming audio discarded\n");
+        }
+
+        return true;
     }
 
     void eventCallback(notifyEvent_t event, const char* message) {
@@ -399,10 +548,11 @@ private:
                 } else {
                     // Any non-audio message from the server means the old TTS
                     // response has ended; re-enable audio injection.
+                    // A clear handled below re-arms the flag afterwards.
                     m_discardAudio.store(false, std::memory_order_release);
                     if (pr.ok == SWITCH_TRUE) {
                         m_notify(psession, EVENT_PLAY, msg.c_str());
-                    } else {
+                    } else if (!handleMarkOrClear(psession, msg)) {
                         // fall back to EVENT_JSON
                         m_notify(psession, EVENT_JSON, msg.c_str());
                     }
@@ -566,6 +716,11 @@ private:
     // Barge-in: drop incoming raw audio until the server sends a non-audio
     // message (which signals the old TTS response has ended).
     std::atomic<bool> m_discardAudio{false};
+    // Marks awaiting playback completion
+    std::mutex m_marksMutex;
+    std::queue<QueuedMark> m_Marks;
+    uint32_t m_markSequenceNumber{0};
+    std::atomic<uint32_t> m_frameBytes{0};
 };
 
 
@@ -632,12 +787,29 @@ namespace {
             return NULL;
         }
 
+        // Publish the frame size for markDue()
+        {
+            std::shared_ptr<AudioStreamer> streamer;
+            switch_mutex_lock(tech_pvt->mutex);
+            if (tech_pvt->pAudioStreamer) {
+                auto *sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+                if (sp_wrap && *sp_wrap) streamer = *sp_wrap;
+            }
+            switch_mutex_unlock(tech_pvt->mutex);
+            if (streamer) streamer->setFrameBytes(bytes);
+        }
+
         while (!tech_pvt->close_requested && switch_core_session_running(session)) {
+            bool have_played = false;
+            uint64_t played = 0;
+
             if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
                 switch_size_t available = switch_buffer_inuse(tech_pvt->write_sbuffer);
                 if (available >= bytes) {
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
+                    // Count as played even if the write below is skipped
+                    tech_pvt->total_bytes_played += write_frame.datalen;
                     /* Only write when the channel is still live. Skipping this check is the
                        root cause of the hung-session bug: switch_core_session_write_frame()
                        blocks acquiring the session I/O lock while the session teardown path
@@ -646,8 +818,27 @@ namespace {
                         switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
                     }
                 }
+                played = tech_pvt->total_bytes_played;
+                have_played = true;
                 switch_mutex_unlock(tech_pvt->write_mutex);
             }
+
+            /* Copy the shared_ptr under mutex: cleanup nulls pAudioStreamer and
+               deletes the wrapper before joining this thread. trylock keeps the
+               timer cadence; checkMarks is level-triggered so a skipped tick
+               self-heals. */
+            if (have_played) {
+                std::shared_ptr<AudioStreamer> streamer;
+                if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+                    if (tech_pvt->pAudioStreamer) {
+                        auto *sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
+                        if (sp_wrap && *sp_wrap) streamer = *sp_wrap;
+                    }
+                    switch_mutex_unlock(tech_pvt->mutex);
+                }
+                if (streamer) streamer->checkMarks(played);
+            }
+
             switch_core_timer_next(&timer);
         }
 

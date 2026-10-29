@@ -454,7 +454,7 @@ private:
         if (__atomic_load_n(&tech_pvt->close_requested, __ATOMIC_RELAXED)) return;
 
         const int outRate = tech_pvt->sampling;
-        const int channels = 1;
+        const int channels = tech_pvt->channels;
         const int inRate = sampleRate ? sampleRate : tech_pvt->wsSampling;
 
         if (rawAudio.empty() || channels <= 0) return;
@@ -811,7 +811,7 @@ namespace {
         switch_codec_t *read_codec;
 
         uint32_t sample_rate = tech_pvt->sampling;
-        uint32_t channels = 1;
+        uint32_t channels = tech_pvt->channels;
 
         read_codec = switch_core_session_get_read_codec(session);
         if (!read_codec || !read_codec->implementation) {
@@ -821,7 +821,7 @@ namespace {
 
         uint32_t interval = read_codec->implementation->microseconds_per_packet / 1000;
         uint32_t samples = switch_samples_per_packet(sample_rate, interval);
-        uint32_t tsamples = read_codec->implementation->samples_per_packet;
+        uint32_t tsamples = read_codec->implementation->actual_samples_per_second;
         uint32_t bytes = samples * 2 * channels;
 
         if (switch_core_codec_init(&write_codec, "L16", NULL, NULL, sample_rate, interval, channels,
@@ -871,15 +871,13 @@ namespace {
         while (!__atomic_load_n(&tech_pvt->close_requested, __ATOMIC_RELAXED) && switch_core_session_running(session)) {
             uint64_t played = 0;
             write_frame.datalen = (uint32_t)playback->pop((uint8_t *)write_frame.data, bytes, played);
-            if (!write_frame.datalen) {
-                memset(write_frame.data, 0, bytes);
-                write_frame.datalen = bytes;
-            }
-            write_frame.samples = write_frame.datalen / 2 / channels;
-            /* Required: writing to a dying channel blocks on the session I/O
-                lock that teardown holds, deadlocking cleanup. */
-            if (switch_channel_ready(channel)) {
-                switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+            if (write_frame.datalen) {
+                write_frame.samples = write_frame.datalen / 2 / channels;
+                /* Required: writing to a dying channel blocks on the session I/O
+                   lock that teardown holds, deadlocking cleanup. */
+                if (switch_channel_ready(channel)) {
+                    switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                }
             }
 
             /* Copy the shared_ptr under mutex: cleanup nulls pAudioStreamer and
@@ -952,7 +950,7 @@ namespace {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing read resampler: %s.\n", speex_resampler_strerror(err));
                 return SWITCH_STATUS_FALSE;
             }
-            tech_pvt->write_resampler = speex_resampler_init(1, desiredSampling, sampling, SWITCH_RESAMPLE_QUALITY, &err);
+            tech_pvt->write_resampler = speex_resampler_init(channels, desiredSampling, sampling, SWITCH_RESAMPLE_QUALITY, &err);
             if (0 != err) {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing write resampler: %s.\n", speex_resampler_strerror(err));
                 return SWITCH_STATUS_FALSE;
